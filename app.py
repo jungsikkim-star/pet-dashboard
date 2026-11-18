@@ -29,7 +29,8 @@ OUT_SHEET = "RAW_출고(벤플)"
 STOCK_SHEET = "SKU별 재고 현황(쿠팡)"
 SUMMARY_SHEET = "요약"
 GROUP_TARGET_SHEET = "상품군목표"  # 선택: 월 | 상품군 | 목표(원)
-RAW_SHEET = "원재료"  # 선택: 원재료 | 구분(현재고/입고예정) | 날짜 | 수량(톤) | 비고
+RAW_SHEET = "모래원재료"  # 선택: 원재료 | 구분(현재고/입고예정) | 날짜 | 수량(톤) | 비고
+RAW_SHEET_NAMES = ["모래원재료", "원재료"]  # 이 이름 중 먼저 찾은 시트를 읽음
 RAW_MATS = ["볼", "파쇄"]
 
 TYPE_ORDER = ["볼", "파쇄", "두부", "마이티펫", "장작", "필름", "리빙용품", "기저귀", "필터", "트리"]
@@ -216,9 +217,10 @@ def parse_group_target(raw: pd.DataFrame) -> dict:
 
 def parse_raw_sheet(xls: pd.ExcelFile):
     """원재료 시트 → DataFrame(원재료, 구분, 날짜, 수량(톤), 비고). 없으면 None"""
-    if RAW_SHEET not in xls.sheet_names:
+    name = next((n for n in RAW_SHEET_NAMES if n in xls.sheet_names), None)
+    if name is None:
         return None
-    raw = pd.read_excel(xls, RAW_SHEET, header=None)
+    raw = pd.read_excel(xls, name, header=None)
     for i in range(min(10, len(raw))):
         row = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[i].tolist()]
         if "원재료" in row and "구분" in row:
@@ -934,22 +936,23 @@ def raw_plan(mat: str, rows: pd.DataFrame):
     days = pd.date_range(start, periods=RAW_HORIZON + 1)
 
     def sim(arr):
+        # 재고는 0 밑으로 내려가지 않음 (모자란 만큼은 생산을 못 한 것으로 봄)
         lv, res = stock0, []
         for i, d in enumerate(days):
             if i > 0:
-                lv -= daily
+                lv = max(lv - daily, 0.0)
             lv += arr.get(d, 0)
             res.append(lv)
         return np.array(res)
 
     base_traj = sim(arrivals)
-    neg = np.where(base_traj < 0)[0]
+    neg = np.where(base_traj <= 0)[0] if daily > 0 else []
     runout = days[neg[0]] if len(neg) else None
 
     # 오늘 발주해도 리드타임 안에는 못 받으므로, 그 기간의 부족은 '발주로 못 막는 부족'으로 따로 셈
     earliest = base_ts + pd.Timedelta(days=int(raw_lead))
     in_lead = days < earliest
-    gap_in_lead = int(((base_traj < 0) & in_lead).sum())
+    gap_in_lead = int(((base_traj <= 0) & in_lead).sum()) if daily > 0 else 0
     low_in_lead = bool(((base_traj < safety) & in_lead).any())
 
     arr2, planned, last_arrive = dict(arrivals), [], earliest - pd.Timedelta(days=1)
