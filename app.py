@@ -456,6 +456,7 @@ base_ts = pd.Timestamp(base_date)
 cur_p = pd.Period(base_ts, "M")
 month_end = cur_p.end_time.normalize()
 
+st.sidebar.caption(f"📄 {up.name}")
 st.sidebar.markdown("---")
 st.sidebar.caption(
     f"매출 데이터: {buy['날짜'].min():%Y-%m-%d} ~ {buy['날짜'].max():%Y-%m-%d}\n\n"
@@ -984,6 +985,13 @@ with tab_raw:
         "발주 필요일 = 재고가 안전재고 아래로 내려가는 날 − 리드타임.  "
         "평택 완제품 재고 변화는 반영하지 않습니다 (설정은 '데이터 설정' 탭)."
     )
+    if raw_mat_xl is None:
+        st.error(
+            f"⚠️ 올린 엑셀에 '{RAW_SHEET}' 시트가 없어, 숨겨진 요약 시트의 현재고만 임시로 쓰고 있습니다 "
+            "(입고 예정분 없음 → 결과가 틀립니다). 모래원재료 시트가 있는 최신 엑셀을 저장한 뒤 다시 올려 주세요."
+        )
+    else:
+        st.success(f"'{RAW_SHEET}' 시트에서 원재료 현재고·입고예정을 읽었습니다.")
     for mat in RAW_MATS:
         P = raw_plan(mat, raw_rows)
         st.markdown(f"#### 벤토나이트 {mat}")
