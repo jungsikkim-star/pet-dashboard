@@ -169,6 +169,49 @@ def parse_summary(xls: pd.ExcelFile, fallback_year: int):
     return target, prior
 
 
+def to_month(v):
+    """셀 값 → 'YYYY-MM' (날짜 셀, '2026-11', '2026.11', '2026년 11월' 모두 허용)"""
+    if isinstance(v, (datetime, pd.Timestamp)):
+        return str(pd.Period(v, "M"))
+    m = re.match(r"^\s*(\d{4})\s*[-./년]\s*(\d{1,2})", str(v))
+    return f"{int(m.group(1))}-{int(m.group(2)):02d}" if m else None
+
+
+def parse_group_target(raw: pd.DataFrame) -> dict:
+    """상품군목표 시트 → {('YYYY-MM', 행 이름): 목표금액}"""
+    res = {}
+    top = min(10, len(raw))
+    # 세로형: 머리글에 월 / 상품군 / 목표
+    for i in range(top):
+        row = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[i].tolist()]
+        if {"월", "상품군", "목표"} <= set(row):
+            cm, cg, cv = row.index("월"), row.index("상품군"), row.index("목표")
+            for k in range(i + 1, len(raw)):
+                per, lab = to_month(raw.iat[k, cm]), raw.iat[k, cg]
+                v = pd.to_numeric(raw.iat[k, cv], errors="coerce")
+                if per and pd.notna(lab) and pd.notna(v):
+                    key = (per, str(lab).strip())
+                    res[key] = res.get(key, 0) + float(v)
+            return res
+    # 가로형: 머리글 행에 월이 가로로, 왼쪽 칸들이 상품군 이름
+    for i in range(top):
+        cols = {j: to_month(v) for j, v in enumerate(raw.iloc[i].tolist()) if pd.notna(v) and to_month(v)}
+        if not cols:
+            continue
+        first = min(cols)
+        for k in range(i + 1, len(raw)):
+            parts = [str(raw.iat[k, j]).strip() for j in range(first) if pd.notna(raw.iat[k, j])]
+            lab = " ".join(p for p in parts if p)
+            if not lab:
+                continue
+            for j, per in cols.items():
+                v = pd.to_numeric(raw.iat[k, j], errors="coerce")
+                if pd.notna(v):
+                    res[(per, lab)] = res.get((per, lab), 0) + float(v)
+        break
+    return res
+
+
 @st.cache_data(show_spinner="엑셀 읽는 중...")
 def load_workbook(data: bytes):
     xls = pd.ExcelFile(io.BytesIO(data))
@@ -219,20 +262,10 @@ def load_workbook(data: bytes):
     if stock is not None:
         names = stock.set_index("sku id")[["품명", "유형"]].combine_first(names)
 
-    # 선택 시트: 상품군목표 (월, 상품군, 목표)
+    # 선택 시트: 상품군목표 — 가로형(상품군 × 월) 또는 세로형(월 | 상품군 | 목표)
     grp_target = {}
     if GROUP_TARGET_SHEET in xls.sheet_names:
-        gt = pd.read_excel(xls, GROUP_TARGET_SHEET)
-        gt.columns = [str(c).strip() for c in gt.columns]
-        if {"월", "상품군", "목표"} <= set(gt.columns):
-            for mo, grp, v in gt[["월", "상품군", "목표"]].itertuples(index=False):
-                try:
-                    per = pd.Period(pd.to_datetime(str(mo).strip()[:7] if not isinstance(mo, (datetime, pd.Timestamp)) else mo), "M")
-                except Exception:  # noqa: BLE001
-                    continue
-                v = pd.to_numeric(v, errors="coerce")
-                if pd.notna(v) and pd.notna(grp):
-                    grp_target[(str(per), str(grp).strip())] = float(v)
+        grp_target = parse_group_target(pd.read_excel(xls, GROUP_TARGET_SHEET, header=None))
 
     return buy, out, stock, stock_date, target, prior, names, grp_target
 
@@ -241,10 +274,9 @@ def load_workbook(data: bytes):
 # 상품군 / 표시 형식
 # ─────────────────────────────────────────────
 GROUPS = [
-    ("벤토 모래(볼)", ["볼"]),
-    ("벤토 모래(파쇄)", ["파쇄"]),
-    ("두부모래", ["두부"]),
-    ("마이티펫", ["마이티펫"]),
+    ("벤토 모래(볼·파쇄)", ["볼", "파쇄"]),
+    ("두부모래(쿠팡)", ["두부"]),
+    ("마이티펫(네이버)", ["마이티펫"]),
     ("장작", ["장작"]),
     ("모니터보호필름", ["필름"]),
     ("강아지 기저귀", ["기저귀"]),
@@ -256,6 +288,34 @@ TYPE2GRP = {t: g for g, ts in GROUPS for t in ts}
 GRP_ORDER = [g for g, _ in GROUPS]
 BRANDS = ("코멧", "탐사", "홈플래닛")
 BRAND_GROUPS = ("강아지 기저귀", "주방용품")  # 브랜드별로 펼칠 상품군
+TYPE_SPLIT_GROUPS = ("벤토 모래(볼·파쇄)",)  # 유형별로 펼칠 상품군
+
+
+def label_to_group(label):
+    """상품군목표 시트의 행 이름 → 대시보드 상품군 (합계 행·모르는 이름은 None)"""
+    s = norm(label)
+    if "합계" in s or "total" in s:
+        return None
+    for g in GRP_ORDER:
+        if s == norm(g):
+            return g
+    if "마이티펫" in s:
+        return "마이티펫(네이버)"
+    if "두부" in s:
+        return "두부모래(쿠팡)"
+    if any(k in s for k in ("벤토", "볼", "파쇄", "제조")):
+        return "벤토 모래(볼·파쇄)"
+    if "장작" in s:
+        return "장작"
+    if "필름" in s:
+        return "모니터보호필름"
+    if "기저귀" in s:
+        return "강아지 기저귀"
+    if any(k in s for k in ("주방", "리빙", "냄비")):
+        return "주방용품"
+    if "필터" in s:
+        return "차량용 공기필터"
+    return None
 
 
 def fmt_krw(x) -> str:
@@ -348,12 +408,24 @@ active_groups = [g for g in GRP_ORDER
 with tab_set:
     st.subheader(f"{cur_p.month}월 상품군별 목표")
     st.caption(
-        f"엑셀에 '{GROUP_TARGET_SHEET}' 시트(열: 월 | 상품군 | 목표)를 만들어 두면 자동으로 읽습니다. "
-        "여기서 고친 값은 이 화면을 새로고침하면 사라지니, 계속 쓸 목표는 엑셀에 넣어 주세요."
+        f"엑셀 '{GROUP_TARGET_SHEET}' 시트에서 자동으로 읽습니다 (상품군 × 월 표). "
+        "여기서 고친 값은 새로고침하면 사라지니, 계속 쓸 목표는 엑셀에 넣어 주세요."
     )
+    xl_month, unmatched = {}, []
+    for (per, lab), v in grp_target_xl.items():
+        if per != str(cur_p):
+            continue
+        g = label_to_group(lab)
+        if g:
+            xl_month[g] = xl_month.get(g, 0) + v
+        elif not any(k in norm(lab) for k in ("합계", "total")):
+            unmatched.append(lab)
+    if unmatched:
+        st.warning("상품군을 알아보지 못한 목표 행: " + ", ".join(unmatched))
+    tgt_groups = active_groups + [g for g in xl_month if g not in active_groups]
     tgt_df = pd.DataFrame({
-        "상품군": active_groups,
-        "목표(만원)": [grp_target_xl.get((str(cur_p), g), np.nan) / 1e4 for g in active_groups],
+        "상품군": tgt_groups,
+        "목표(만원)": [xl_month.get(g, np.nan) / 1e4 for g in tgt_groups],
     })
     edited = st.data_editor(
         tgt_df, hide_index=True, use_container_width=False, key=f"grp_tgt_{cur_p}",
@@ -361,8 +433,12 @@ with tab_set:
         column_config={"목표(만원)": st.column_config.NumberColumn(min_value=0, step=100, format="%.0f")},
     )
     grp_target = {g: float(v) * 1e4 for g, v in zip(edited["상품군"], edited["목표(만원)"]) if pd.notna(v) and v > 0}
-    total_tgt = target.get((cur_p.year, cur_p.month))
-    st.caption(f"전체 목표는 요약 시트의 목표매출 행에서 읽습니다: {cur_p.month}월 {fmt_krw(total_tgt)}")
+    summary_tgt = target.get((cur_p.year, cur_p.month))
+    grp_sum = sum(grp_target.values())
+    # 공식 목표 = 상품군 목표 합계. 상품군 목표가 하나도 없을 때만 요약 시트 목표매출을 씀
+    total_tgt = grp_sum if grp_sum else summary_tgt
+    st.caption(f"'전체' 목표 = 상품군 목표 합계 {fmt_krw(grp_sum)}" if grp_sum else
+               f"상품군 목표가 없어 '전체'는 요약 시트 목표매출({fmt_krw(summary_tgt)})을 씁니다.")
 
     st.markdown("---")
     st.subheader("재고 계산 설정")
@@ -524,7 +600,8 @@ with tab_sales:
                 f'<div class="cap">큰 숫자 = 달성액(실적+확정)과 목표 대비 % · 검은 선 = 목표 · 기준일 {base_date:%m/%d}</div>',
                 unsafe_allow_html=True)
     cards = card_html("전체", buy, total_tgt)
-    for g in active_groups:
+    card_groups = [g for g in GRP_ORDER if g in active_groups or g in grp_target]
+    for g in card_groups:
         cards += card_html(g, buy[buy["상품군"] == g], grp_target.get(g))
     st.markdown(f'<div class="cards">{cards}</div>'
                 '<div class="legend"><i style="background:#2f5d8a"></i>실적(기준일까지 납품)'
@@ -573,11 +650,14 @@ with tab_sales:
     st.markdown('<div class="sec">📅 상품군별 월 매출 (최근 12개월)</div>'
                 '<div class="cap">색이 진할수록 그 행 안에서 매출이 큰 달 · 이번 달은 실적+확정+예측 · '
                 '누적은 올해 1월부터 (이번 달은 실적+확정만)</div>', unsafe_allow_html=True)
-    split = st.toggle("강아지 기저귀 · 주방용품 브랜드별로 펼치기", value=False)
+    split = st.toggle("세부 펼치기 (벤토 모래 → 볼·파쇄 / 기저귀·주방용품 → 브랜드)", value=False)
     rows = []
     for g in active_groups:
         gdf = buy[buy["상품군"] == g]
         rows.append((g, gdf, "normal"))
+        if split and g in TYPE_SPLIT_GROUPS:
+            for t in sort_types(gdf["유형"].unique()):
+                rows.append((f"└ {t}", gdf[gdf["유형"] == t], "sub"))
         if split and g in BRAND_GROUPS:
             for b in [b for b in BRANDS if b in gdf["브랜드"].unique()]:
                 rows.append((f"└ {b}", gdf[gdf["브랜드"] == b], "sub"))
