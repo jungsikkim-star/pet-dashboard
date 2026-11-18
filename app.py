@@ -29,6 +29,8 @@ OUT_SHEET = "RAW_출고(벤플)"
 STOCK_SHEET = "SKU별 재고 현황(쿠팡)"
 SUMMARY_SHEET = "요약"
 GROUP_TARGET_SHEET = "상품군목표"  # 선택: 월 | 상품군 | 목표(원)
+RAW_SHEET = "원재료"  # 선택: 원재료 | 구분(현재고/입고예정) | 날짜 | 수량(톤) | 비고
+RAW_MATS = ["볼", "파쇄"]
 
 TYPE_ORDER = ["볼", "파쇄", "두부", "마이티펫", "장작", "필름", "리빙용품", "기저귀", "필터", "트리"]
 # 쿠팡 납품 리드타임(일) 기본값: 쿠팡 PO를 받고 VF에 입고되기까지. 사이드바에서 바꿀 수 있음
@@ -212,6 +214,64 @@ def parse_group_target(raw: pd.DataFrame) -> dict:
     return res
 
 
+def parse_raw_sheet(xls: pd.ExcelFile):
+    """원재료 시트 → DataFrame(원재료, 구분, 날짜, 수량(톤), 비고). 없으면 None"""
+    if RAW_SHEET not in xls.sheet_names:
+        return None
+    raw = pd.read_excel(xls, RAW_SHEET, header=None)
+    for i in range(min(10, len(raw))):
+        row = [str(v).strip() if pd.notna(v) else "" for v in raw.iloc[i].tolist()]
+        if "원재료" in row and "구분" in row:
+            def col(*names):
+                for n in names:
+                    for j, h in enumerate(row):
+                        if h.replace(" ", "").startswith(n):
+                            return j
+                return None
+            cm, cg, cd, cq = col("원재료"), col("구분"), col("날짜", "입고예정일", "일자"), col("수량", "톤")
+            cb, co = col("비고"), col("발주일")
+            if None in (cm, cg, cq):
+                return None
+            body = raw.iloc[i + 1:]
+            df = pd.DataFrame({
+                "원재료": body.iloc[:, cm].astype("string").str.strip(),
+                "구분": body.iloc[:, cg].astype("string").str.strip(),
+                "날짜": pd.to_datetime(body.iloc[:, cd], errors="coerce") if cd is not None else pd.NaT,
+                "수량(톤)": pd.to_numeric(body.iloc[:, cq], errors="coerce"),
+                "비고": body.iloc[:, cb].astype("string") if cb is not None else "",
+            })
+            if co is not None:  # 입고일이 비어 있고 발주일만 있으면 비고에 남겨 둠
+                od = pd.to_datetime(body.iloc[:, co], errors="coerce")
+                df["발주일"] = od.values
+            df["원재료"] = df["원재료"].str.replace("벤토나이트", "").str.replace("_", "").str.replace("모래", "").str.strip()
+            df.loc[df["원재료"].str.contains("볼", na=False), "원재료"] = "볼"
+            df.loc[df["원재료"].str.contains("파쇄", na=False), "원재료"] = "파쇄"
+            df.loc[df["구분"].str.contains("현재", na=False), "구분"] = "현재고"
+            df.loc[df["구분"].str.contains("입고|예정", na=False), "구분"] = "입고예정"
+            return df[df["원재료"].isin(RAW_MATS) & df["수량(톤)"].notna()].reset_index(drop=True)
+    return None
+
+
+def parse_summary_raw_stock(xls: pd.ExcelFile) -> dict:
+    """요약 시트 입고예정표의 '벤토나이트_볼/파쇄' 현재고 (원재료 시트가 없을 때 임시로 씀)"""
+    res = {}
+    if SUMMARY_SHEET not in xls.sheet_names:
+        return res
+    raw = pd.read_excel(xls, SUMMARY_SHEET, header=None)
+    for i in range(len(raw)):
+        vals = raw.iloc[i].tolist()
+        for j, v in enumerate(vals):
+            name = str(v).replace(" ", "")
+            for mat in RAW_MATS:
+                if name in (f"벤토나이트_{mat}", f"벤토나이트{mat}") and mat not in res:
+                    for w in vals[j + 1:]:
+                        n = pd.to_numeric(w, errors="coerce")
+                        if pd.notna(n):
+                            res[mat] = float(n)
+                            break
+    return res
+
+
 @st.cache_data(show_spinner="엑셀 읽는 중...")
 def load_workbook(data: bytes):
     xls = pd.ExcelFile(io.BytesIO(data))
@@ -267,7 +327,10 @@ def load_workbook(data: bytes):
     if GROUP_TARGET_SHEET in xls.sheet_names:
         grp_target = parse_group_target(pd.read_excel(xls, GROUP_TARGET_SHEET, header=None))
 
-    return buy, out, stock, stock_date, target, prior, names, grp_target
+    raw_mat = parse_raw_sheet(xls)
+    raw_fallback = parse_summary_raw_stock(xls) if raw_mat is None else {}
+
+    return buy, out, stock, stock_date, target, prior, names, grp_target, raw_mat, raw_fallback
 
 
 # ─────────────────────────────────────────────
@@ -374,7 +437,8 @@ if up is None:
     st.stop()
 
 try:
-    buy, out, stock, stock_date, target, prior, sku_names, grp_target_xl = load_workbook(up.getvalue())
+    (buy, out, stock, stock_date, target, prior, sku_names, grp_target_xl,
+     raw_mat_xl, raw_fallback) = load_workbook(up.getvalue())
 except Exception as e:  # noqa: BLE001
     st.error(f"엑셀을 읽지 못했습니다: {e}")
     st.stop()
@@ -397,7 +461,8 @@ st.sidebar.caption(
     + (f"쿠팡 현재고 기준: {stock_date:%Y-%m-%d}" if stock_date is not None else "재고 현황 시트 없음")
 )
 
-tab_sales, tab_inv, tab_set = st.tabs(["💰 매출 · 쿠팡 PO", "📦 재고 · 결품", "⚙️ 데이터 설정 · 점검"])
+tab_sales, tab_inv, tab_raw, tab_set = st.tabs(
+    ["💰 매출 · 쿠팡 PO", "📦 재고 · 결품", "🏭 원재료 발주", "⚙️ 데이터 설정 · 점검"])
 
 # ─────────────────────────────────────────────
 # 3. 데이터 설정 (다른 탭이 이 값을 쓰므로 먼저 그림)
@@ -452,6 +517,48 @@ with tab_set:
         for i, t in enumerate(types_in_stock):
             lead[t] = lc[i % 4].number_input(t, min_value=0, max_value=180, value=DEFAULT_LEAD.get(t, 5),
                                              step=1, key=f"lead_{t}")
+
+    st.markdown("---")
+    st.subheader("원재료(벤토나이트) 발주 설정")
+    r1, r2, r3, r4 = st.columns(4)
+    raw_lead = r1.number_input("발주 → 공장 입고 (일)", min_value=0, max_value=180, value=40, step=1, key="raw_lead")
+    raw_safety = r2.number_input("안전재고 (며칠분)", min_value=0, max_value=90, value=14, step=1, key="raw_safety")
+    raw_yield = r3.number_input("수율 (제품 톤 ÷ 원재료 톤)", min_value=0.5, max_value=1.2, value=1.0, step=0.01,
+                                key="raw_yield")
+    raw_window = r4.selectbox("하루 사용량 기준 기간", [30, 60, 90], index=2, format_func=lambda d: f"최근 {d}일",
+                              key="raw_window")
+    u1, u2, _, _ = st.columns(4)
+    raw_unit = {
+        "볼": u1.selectbox("볼 발주 단위(톤)", [220, 330], index=1, key="unit_볼"),
+        "파쇄": u2.selectbox("파쇄 발주 단위(톤)", [220, 330], index=0, key="unit_파쇄"),
+    }
+
+    if raw_mat_xl is not None:
+        st.caption(f"원재료 현재고·입고예정은 엑셀 '{RAW_SHEET}' 시트에서 읽었습니다. 아래에서 고친 값은 새로고침하면 사라집니다.")
+        raw_init = raw_mat_xl[["원재료", "구분", "날짜", "수량(톤)", "비고"]].copy()
+    else:
+        st.warning(
+            f"엑셀에 '{RAW_SHEET}' 시트가 없어 요약 시트 입고예정표의 현재고만 임시로 넣었습니다. "
+            "입고 예정분은 아래 표에 직접 추가하거나, 엑셀에 시트를 만들어 주세요 "
+            "(열: 원재료 | 구분(현재고/입고예정) | 날짜 | 수량(톤) | 비고)."
+        )
+        raw_init = pd.DataFrame([
+            {"원재료": m, "구분": "현재고", "날짜": base_ts, "수량(톤)": v, "비고": "요약 시트에서 읽음 · 확인 필요"}
+            for m, v in raw_fallback.items()
+        ], columns=["원재료", "구분", "날짜", "수량(톤)", "비고"])
+    raw_init["날짜"] = pd.to_datetime(raw_init["날짜"], errors="coerce").dt.date
+    raw_init["비고"] = raw_init["비고"].fillna("").astype(str)
+    raw_rows = st.data_editor(
+        raw_init, num_rows="dynamic", hide_index=True, use_container_width=True, key="raw_editor",
+        column_config={
+            "원재료": st.column_config.SelectboxColumn(options=RAW_MATS, required=True),
+            "구분": st.column_config.SelectboxColumn(options=["현재고", "입고예정"], required=True),
+            "날짜": st.column_config.DateColumn("날짜 (현재고 기준일 / 입고예정일)", format="YYYY-MM-DD"),
+            "수량(톤)": st.column_config.NumberColumn(min_value=0, format="%.1f"),
+            "비고": st.column_config.TextColumn("비고 ('완료'라고 쓰면 계산에서 뺌)"),
+        },
+    )
+
 
 def compute_inv():
     if stock is None:
@@ -792,6 +899,166 @@ with tab_inv:
                                             "발주일": st.column_config.DateColumn(format="YYYY-MM-DD"),
                                             "수량(BOX)": st.column_config.NumberColumn(format="localized"),
                                             "금액(원)": st.column_config.NumberColumn(format="localized")})
+
+
+# ─────────────────────────────────────────────
+# 원재료 발주
+# ─────────────────────────────────────────────
+RAW_HORIZON = 150
+
+
+def raw_plan(mat: str, rows: pd.DataFrame):
+    rows = rows.copy()
+    rows["날짜"] = pd.to_datetime(rows["날짜"], errors="coerce")
+    rows = rows[(rows["원재료"] == mat) & rows["수량(톤)"].notna()]
+    st_rows = rows[rows["구분"] == "현재고"]
+    if st_rows.empty:
+        return None
+    srow = st_rows.sort_values("날짜", na_position="first").iloc[-1]
+    start = srow["날짜"].normalize() if pd.notna(srow["날짜"]) else base_ts
+    stock0 = float(srow["수량(톤)"])
+
+    inb = rows[rows["구분"] == "입고예정"]
+    inb = inb[~inb["비고"].astype(str).str.contains("완료", na=False)]
+    undated = inb[inb["날짜"].isna()]
+    inb = inb[inb["날짜"].notna()]
+    arrivals = {}
+    for d, q in zip(inb["날짜"], inb["수량(톤)"]):
+        d = max(d.normalize(), start)
+        arrivals[d] = arrivals.get(d, 0) + float(q)
+
+    prod = buy[(buy["구분"] == "제품") & (buy["유형"] == mat) & (buy["날짜"] <= base_ts)
+               & (buy["날짜"] > base_ts - pd.Timedelta(days=raw_window))]
+    daily = float(prod["수량(톤)"].sum()) / raw_window / raw_yield
+    safety = daily * raw_safety
+    days = pd.date_range(start, periods=RAW_HORIZON + 1)
+
+    def sim(arr):
+        lv, res = stock0, []
+        for i, d in enumerate(days):
+            if i > 0:
+                lv -= daily
+            lv += arr.get(d, 0)
+            res.append(lv)
+        return np.array(res)
+
+    base_traj = sim(arrivals)
+    neg = np.where(base_traj < 0)[0]
+    runout = days[neg[0]] if len(neg) else None
+
+    # 오늘 발주해도 리드타임 안에는 못 받으므로, 그 기간의 부족은 '발주로 못 막는 부족'으로 따로 셈
+    earliest = base_ts + pd.Timedelta(days=int(raw_lead))
+    in_lead = days < earliest
+    gap_in_lead = int(((base_traj < 0) & in_lead).sum())
+    low_in_lead = bool(((base_traj < safety) & in_lead).any())
+
+    arr2, planned, last_arrive = dict(arrivals), [], earliest - pd.Timedelta(days=1)
+    if daily > 0:
+        for _ in range(8):
+            traj = sim(arr2)
+            cand = [i for i in np.where(traj < safety)[0] if days[i] > last_arrive]
+            if not cand:
+                break
+            need = days[cand[0]]
+            order = max(need - pd.Timedelta(days=int(raw_lead)), base_ts)
+            arrive = order + pd.Timedelta(days=int(raw_lead))
+            arr2[arrive] = arr2.get(arrive, 0) + raw_unit[mat]
+            planned.append({"발주일": order, "입고예정일": arrive, "수량(톤)": raw_unit[mat],
+                            "재고가 안전재고 아래로": need})
+            last_arrive = arrive
+            if arrive > days[-1]:
+                break
+    return {"start": start, "stock0": stock0, "arrivals": arrivals, "undated": undated, "daily": daily,
+            "safety": safety, "days": days, "base": base_traj, "plan_traj": sim(arr2), "runout": runout,
+            "planned": planned, "gap_in_lead": gap_in_lead, "low_in_lead": low_in_lead, "earliest": earliest}
+
+
+with tab_raw:
+    st.subheader("원재료(벤토나이트) 발주 필요 시기")
+    st.caption(
+        f"하루 사용량 = 최근 {raw_window}일 볼·파쇄 제품 납품 톤 ÷ {raw_window} ÷ 수율 {raw_yield:g}  ·  "
+        f"발주 → 공장 입고 {raw_lead}일  ·  안전재고 {raw_safety}일분  ·  "
+        "발주 필요일 = 재고가 안전재고 아래로 내려가는 날 − 리드타임.  "
+        "평택 완제품 재고 변화는 반영하지 않습니다 (설정은 '데이터 설정' 탭)."
+    )
+    for mat in RAW_MATS:
+        P = raw_plan(mat, raw_rows)
+        st.markdown(f"#### 벤토나이트 {mat}")
+        if P is None:
+            st.info(f"{mat} 원재료 현재고가 없습니다. '데이터 설정' 탭 표나 엑셀 '{RAW_SHEET}' 시트에 넣어 주세요.")
+            continue
+        planned = P["planned"]
+        nxt = planned[0] if planned else None
+        if P["daily"] <= 0:
+            status = "⚪ 최근 사용량 없음"
+        elif nxt is None:
+            status = f"🟢 {RAW_HORIZON}일 안에 추가 발주 불필요"
+        elif (nxt["발주일"] - base_ts).days <= 0:
+            status = f"🟠 오늘 발주 필요 ({nxt['수량(톤)']}톤 → {nxt['입고예정일']:%m/%d} 입고)"
+        elif (nxt["발주일"] - base_ts).days <= 7:
+            status = f"🟠 {nxt['발주일']:%m/%d}까지 발주 ({(nxt['발주일'] - base_ts).days}일 남음)"
+        else:
+            status = f"🟢 {nxt['발주일']:%m/%d}까지 발주 ({(nxt['발주일'] - base_ts).days}일 남음)"
+        st.markdown(f"**{status}**")
+        if P["gap_in_lead"]:
+            st.error(f"🔴 앞으로 {raw_lead}일({P['earliest']:%m/%d}) 안에 약 {P['gap_in_lead']}일 재고 공백이 예상됩니다. "
+                     "지금 발주해도 그 전에는 못 받으니, 이미 발주한 물량의 입고를 앞당기거나 생산 계획을 조정해야 합니다.")
+        elif P["low_in_lead"]:
+            st.caption(f"⚠️ {P['earliest']:%m/%d} 전에 재고가 안전재고 아래로 잠깐 내려갑니다 (재고 공백은 없음).")
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        cover = P["stock0"] / P["daily"] if P["daily"] > 0 else np.inf
+        m1.metric(f"현재고 ({P['start']:%m/%d})", f"{P['stock0']:,.0f}톤",
+                  f"{cover:,.1f}일분" if np.isfinite(cover) else None, delta_color="off")
+        m2.metric("입고 예정 (확정)", f"{sum(P['arrivals'].values()):,.0f}톤",
+                  f"{len(P['arrivals'])}건", delta_color="off")
+        m3.metric("하루 사용량", f"{P['daily']:,.1f}톤", f"월 {P['daily'] * 30:,.0f}톤", delta_color="off")
+        m4.metric("소진 예상일 (추가 발주 없을 때)", f"{P['runout']:%m/%d}" if P["runout"] is not None else "-",
+                  f"{(P['runout'] - base_ts).days}일 뒤" if P["runout"] is not None else f"{RAW_HORIZON}일 이상",
+                  delta_color="off")
+        m5.metric("다음 발주 필요일", f"{nxt['발주일']:%m/%d}" if nxt else "-",
+                  f"{nxt['수량(톤)']}톤" if nxt else None, delta_color="off")
+
+        if len(P["undated"]):
+            st.warning(f"입고일이 비어 있는 입고예정 {len(P['undated'])}건({P['undated']['수량(톤)'].sum():,.0f}톤)은 "
+                       "계산에서 뺐습니다. 날짜를 넣어 주세요.")
+        if P["start"] < base_ts - pd.Timedelta(days=3):
+            st.caption(f"⚠️ 현재고 기준일({P['start']:%m/%d})이 기준일보다 오래됐습니다. 최신 재고로 바꿔 주세요.")
+
+        g1, g2 = st.columns([3, 2])
+        with g1:
+            fig = go.Figure()
+            fig.add_scatter(x=P["days"], y=P["base"], name="확정 입고만", mode="lines", line=dict(width=2))
+            if planned:
+                fig.add_scatter(x=P["days"], y=P["plan_traj"], name="권장 발주 포함", mode="lines",
+                                line=dict(width=2, dash="dash"))
+            if P["arrivals"]:
+                fig.add_bar(x=list(P["arrivals"].keys()), y=list(P["arrivals"].values()), name="입고 예정",
+                            opacity=0.55)
+            if planned:
+                fig.add_bar(x=[p["입고예정일"] for p in planned], y=[p["수량(톤)"] for p in planned],
+                            name="권장 발주 입고", opacity=0.35)
+            fig.add_hline(y=P["safety"], line_dash="dot", annotation_text=f"안전재고 {P['safety']:,.0f}톤")
+            fig.add_hline(y=0, line_color="red", line_width=1)
+            fig.update_layout(title=f"벤토나이트 {mat} 원재료 재고 예상 ({RAW_HORIZON}일, 톤)", height=360,
+                              legend=dict(orientation="h", y=-0.18), margin=dict(t=50, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        with g2:
+            st.markdown("**권장 발주 일정**")
+            if planned:
+                pdf = pd.DataFrame(planned)
+                st.dataframe(
+                    pdf[["발주일", "입고예정일", "수량(톤)", "재고가 안전재고 아래로"]], hide_index=True,
+                    use_container_width=True,
+                    column_config={"발주일": st.column_config.DateColumn(format="MM/DD"),
+                                   "입고예정일": st.column_config.DateColumn(format="MM/DD"),
+                                   "재고가 안전재고 아래로": st.column_config.DateColumn("안전재고 미달일", format="MM/DD")})
+            else:
+                st.caption("앞으로 추가 발주가 필요하지 않습니다.")
+            if P["daily"] > 0:
+                st.caption(f"발주 단위별 버티는 기간: 220톤 ≈ {220 / P['daily']:,.0f}일, "
+                           f"330톤 ≈ {330 / P['daily']:,.0f}일")
+        st.markdown("---")
 
 
 # ─────────────────────────────────────────────
