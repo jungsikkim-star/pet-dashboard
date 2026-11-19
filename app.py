@@ -358,6 +358,55 @@ def parse_summary_tofu_stock(xls: pd.ExcelFile) -> dict:
     return res
 
 
+ACTUAL_STOCK_SHEET = "sku별 실재고량_25년~"
+
+
+def parse_erp_raw_stock(xls: pd.ExcelFile) -> dict:
+    """sku별 실재고량 시트의 '원재료' 행(ERP 일자별 재고, 톤) → {'볼': Series(날짜→톤), '파쇄': ...}"""
+    name = next((n for n in xls.sheet_names if n.replace(" ", "").startswith("sku별실재고량")), None)
+    if name is None:
+        return {}
+    raw = pd.read_excel(xls, name, header=None)
+    blocks = []  # [ {열: (월, 일)}, {원재료: 행} ]
+    for i in range(len(raw)):
+        b, c = raw.iat[i, 1] if raw.shape[1] > 1 else None, raw.iat[i, 2] if raw.shape[1] > 2 else None
+        if str(b).strip().lower() == "sku id":
+            cols = {}
+            for j in range(4, raw.shape[1]):
+                v = raw.iat[i, j]
+                if pd.isna(v):
+                    continue
+                t = str(int(v)) if isinstance(v, (int, float, np.integer, np.floating)) else str(v).strip()
+                t = t.zfill(4)
+                if re.fullmatch(r"\d{4}", t) and 1 <= int(t[:2]) <= 12:
+                    cols[j] = (int(t[:2]), int(t[2:]))
+            blocks.append([cols, {}])
+        elif str(b).strip() == "원재료" and blocks:
+            mat = "볼" if "볼" in str(c) else ("파쇄" if "파쇄" in str(c) else None)
+            if mat:
+                blocks[-1][1][mat] = i
+    # 연도: 마지막 블록을 오늘 기준으로 잡고 거꾸로 올라가며 월이 커지면 한 해 전
+    year, prev_m, res = TODAY.year, None, {}
+    for cols, items in reversed(blocks):
+        if not cols:
+            continue
+        m = next(iter(cols.values()))[0]
+        if prev_m is None and m > TODAY.month:
+            year -= 1
+        elif prev_m is not None and m > prev_m:
+            year -= 1
+        prev_m = m
+        for mat, i in items.items():
+            for j, (mm, dd) in cols.items():
+                v = pd.to_numeric(raw.iat[i, j], errors="coerce")
+                if pd.notna(v):
+                    try:
+                        res.setdefault(mat, {})[pd.Timestamp(year, mm, dd)] = float(v)
+                    except ValueError:
+                        pass
+    return {k: pd.Series(v).sort_index() for k, v in res.items()}
+
+
 def parse_summary_raw_stock(xls: pd.ExcelFile) -> dict:
     """요약 시트 입고예정표의 '벤토나이트_볼/파쇄' 현재고 (원재료 시트가 없을 때 임시로 씀)"""
     res = {}
@@ -437,13 +486,14 @@ def load_workbook(data: bytes):
     if raw_mat is None:
         raw_mat = parse_raw_sheet(xls)
     raw_fallback = parse_summary_raw_stock(xls) if raw_mat is None else {}
+    raw_erp = parse_erp_raw_stock(xls)
 
     if tofu is None:
         tofu = parse_tofu_sheet(xls)
     tofu_fallback = parse_summary_tofu_stock(xls) if tofu is None else {}
 
     return (buy, out, stock, stock_date, target, prior, names, grp_target, raw_mat, raw_fallback,
-            tofu, tofu_fallback, mightypet)
+            tofu, tofu_fallback, mightypet, raw_erp)
 
 
 # ─────────────────────────────────────────────
@@ -551,7 +601,7 @@ if up is None:
 
 try:
     (buy, out, stock, stock_date, target, prior, sku_names, grp_target_xl,
-     raw_mat_xl, raw_fallback, tofu_xl, tofu_fallback, mightypet_xl) = load_workbook(up.getvalue())
+     raw_mat_xl, raw_fallback, tofu_xl, tofu_fallback, mightypet_xl, raw_erp) = load_workbook(up.getvalue())
 except Exception as e:  # noqa: BLE001
     st.error(f"엑셀을 읽지 못했습니다: {e}")
     st.stop()
@@ -1101,11 +1151,19 @@ def raw_plan(mat: str, rows: pd.DataFrame):
     rows["날짜"] = pd.to_datetime(rows["날짜"], errors="coerce")
     rows = rows[(rows["원재료"] == mat) & rows["수량(톤)"].notna()]
     st_rows = rows[rows["구분"] == "현재고"]
-    if st_rows.empty:
+    # 현재고: ERP(실재고량 시트) 최신값과 재고입고관리 현재고 중 날짜가 더 최근인 것 (같은 날이면 직접 입력값)
+    erp = raw_erp.get(mat)
+    erp = erp[erp.index <= base_ts] if erp is not None else None
+    cand = []
+    if erp is not None and len(erp):
+        cand.append((erp.index[-1].normalize(), 0, float(erp.iloc[-1]), "ERP (실재고량 시트)"))
+    if len(st_rows):
+        srow = st_rows.sort_values("날짜", na_position="first").iloc[-1]
+        d = srow["날짜"].normalize() if pd.notna(srow["날짜"]) else base_ts
+        cand.append((d, 1, float(srow["수량(톤)"]), "재고입고관리 직접 입력"))
+    if not cand:
         return None
-    srow = st_rows.sort_values("날짜", na_position="first").iloc[-1]
-    start = srow["날짜"].normalize() if pd.notna(srow["날짜"]) else base_ts
-    stock0 = float(srow["수량(톤)"])
+    start, _, stock0, stock_src = max(cand)
 
     inb = rows[rows["구분"] == "입고예정"]
     inb = inb[~inb["비고"].astype(str).str.contains("완료", na=False)]
@@ -1119,9 +1177,20 @@ def raw_plan(mat: str, rows: pd.DataFrame):
         d = d.normalize()
         arrivals[d] = arrivals.get(d, 0) + float(q)
 
-    prod = buy[(buy["구분"] == "제품") & (buy["유형"] == mat) & (buy["날짜"] <= base_ts)
-               & (buy["날짜"] > base_ts - pd.Timedelta(days=raw_window))]
-    daily = float(prod["수량(톤)"].sum()) / raw_window / raw_yield
+    # 하루 사용량: ERP 일자별 재고가 있으면 '재고 감소량'(입고일 제외), 없으면 제품 납품 톤 ÷ 수율
+    usage_src = "제품 납품 톤"
+    daily = None
+    if erp is not None and len(erp) >= 2:
+        e_end = erp.index[-1]
+        ew = erp[erp.index > e_end - pd.Timedelta(days=raw_window)]
+        if len(ew) >= min(raw_window, 30) * 0.8:
+            dec = (-ew.diff()).clip(lower=0).sum()
+            daily = float(dec) / max((ew.index[-1] - ew.index[0]).days, 1)
+            usage_src = f"ERP 재고 감소량 ({ew.index[0]:%m/%d}~{ew.index[-1]:%m/%d})"
+    if daily is None:
+        prod = buy[(buy["구분"] == "제품") & (buy["유형"] == mat) & (buy["날짜"] <= base_ts)
+                   & (buy["날짜"] > base_ts - pd.Timedelta(days=raw_window))]
+        daily = float(prod["수량(톤)"].sum()) / raw_window / raw_yield
     safety = daily * raw_safety
     days = pd.date_range(start, periods=RAW_HORIZON + 1)
 
@@ -1161,7 +1230,9 @@ def raw_plan(mat: str, rows: pd.DataFrame):
             last_arrive = arrive
             if arrive > days[-1]:
                 break
-    return {"start": start, "stock0": stock0, "arrivals": arrivals, "undated": undated, "daily": daily,
+    return {"start": start, "stock0": stock0, "stock_src": stock_src, "usage_src": usage_src,
+            "erp_negative": stock_src.startswith("ERP") and stock0 < 0,
+            "arrivals": arrivals, "undated": undated, "daily": daily,
             "included": included,
             "safety": safety, "days": days, "base": base_traj, "plan_traj": sim(arr2), "runout": runout,
             "planned": planned, "gap_in_lead": gap_in_lead, "low_in_lead": low_in_lead, "earliest": earliest}
@@ -1171,12 +1242,13 @@ with tab_raw:
     st.subheader("원재료(벤토나이트) 발주 필요 시기")
     st.caption("입고가 끝나면 현재고 수량과 날짜만 바꾸면 됩니다. 현재고 날짜 이전 입고예정은 자동으로 빠집니다.")
     st.caption(
-        f"하루 사용량 = 최근 {raw_window}일 볼·파쇄 제품 납품 톤 ÷ {raw_window} ÷ 수율 {raw_yield:g}  ·  "
+        f"현재고 = ERP 일자별 재고(실재고량 시트)와 재고입고관리 현재고 중 최신  ·  "
+        f"하루 사용량 = ERP 재고 감소량 최근 {raw_window}일 평균 (ERP 값이 없으면 제품 납품 톤 ÷ 수율 {raw_yield:g})  ·  "
         f"발주 → 공장 입고 {raw_lead}일  ·  안전재고 {raw_safety}일분  ·  "
         "발주 필요일 = 재고가 안전재고 아래로 내려가는 날 − 리드타임.  "
         "평택 완제품 재고 변화는 반영하지 않습니다 (설정은 '데이터 설정' 탭)."
     )
-    if raw_mat_xl is None:
+    if raw_mat_xl is None and not raw_erp:
         st.error(
             f"⚠️ 올린 엑셀에 '{RAW_SHEET}' 시트가 없어, 숨겨진 요약 시트의 현재고만 임시로 쓰고 있습니다 "
             "(입고 예정분 없음 → 결과가 틀립니다). '재고입고관리' 시트가 있는 최신 엑셀을 저장한 뒤 다시 올려 주세요."
@@ -1193,6 +1265,9 @@ with tab_raw:
         nxt = planned[0] if planned else None
         if P["daily"] <= 0:
             status = "⚪ 최근 사용량 없음"
+        elif P["gap_in_lead"]:
+            status = (f"🔴 약 {P['gap_in_lead']}일 재고 공백 예상"
+                      + (f" · 다음 발주 {nxt['발주일']:%m/%d}까지 {nxt['수량(톤)']}톤" if nxt else ""))
         elif nxt is None:
             status = f"🟢 {RAW_HORIZON}일 안에 추가 발주 불필요"
         elif (nxt["발주일"] - base_ts).days <= 0:
@@ -1221,6 +1296,10 @@ with tab_raw:
         m5.metric("다음 발주 필요일", f"{nxt['발주일']:%m/%d}" if nxt else "-",
                   f"{nxt['수량(톤)']}톤" if nxt else None, delta_color="off")
 
+        st.caption(f"현재고 출처: {P['stock_src']}  ·  하루 사용량 출처: {P['usage_src']}")
+        if P["erp_negative"]:
+            st.warning(f"ERP 재고가 {P['stock0']:,.1f}톤(마이너스)입니다. 입고 등록이 빠졌을 가능성이 큽니다. "
+                       "ERP에 입고를 등록하거나, 재고입고관리에 같은 날짜로 실제 현재고를 넣으면 그 값을 씁니다.")
         if len(P["undated"]):
             st.warning(f"입고일이 비어 있는 입고예정 {len(P['undated'])}건({P['undated']['수량(톤)'].sum():,.0f}톤)은 "
                        "계산에서 뺐습니다. 날짜를 넣어 주세요.")
