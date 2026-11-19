@@ -29,9 +29,19 @@ OUT_SHEET = "RAW_출고(벤플)"
 STOCK_SHEET = "SKU별 재고 현황(쿠팡)"
 SUMMARY_SHEET = "요약"
 GROUP_TARGET_SHEET = "상품군목표"  # 선택: 월 | 상품군 | 목표(원)
-RAW_SHEET = "모래원재료"  # 선택: 원재료 | 구분(현재고/입고예정) | 날짜 | 수량(톤) | 비고
+STOCK_IN_SHEET = "재고입고관리"  # 통합: 분류 | 품목 | 구분(현재고/입고예정) | 날짜 | 수량 | 단위 | 비고
+RAW_SHEET = STOCK_IN_SHEET  # 화면 문구용 (예전 '모래원재료' 시트도 계속 읽음)
 RAW_SHEET_NAMES = ["모래원재료", "원재료"]  # 이 이름 중 먼저 찾은 시트를 읽음
 RAW_MATS = ["볼", "파쇄"]
+TOFU_SHEET_NAMES = ["두부모래재고", "두부재고"]  # 선택: 품목 | 구분(현재고/입고예정) | 날짜 | 수량(박스) | 비고
+TOFU_FLAVORS = ["오리지널", "라벤더", "녹차", "복숭아", "베이비", "숯"]
+
+
+def flavor_of(name):
+    for f in TOFU_FLAVORS:
+        if f in str(name):
+            return f
+    return None
 
 TYPE_ORDER = ["볼", "파쇄", "두부", "마이티펫", "장작", "필름", "리빙용품", "기저귀", "필터", "트리"]
 # 쿠팡 납품 리드타임(일) 기본값: 쿠팡 PO를 받고 VF에 입고되기까지. 사이드바에서 바꿀 수 있음
@@ -254,6 +264,100 @@ def parse_raw_sheet(xls: pd.ExcelFile):
     return None
 
 
+def parse_stock_in_sheet(xls: pd.ExcelFile):
+    """재고입고관리 시트(원재료·두부모래·마이티펫 통합) → (원재료 df, 두부 df, 마이티펫 df). 없으면 (None, None, None)"""
+    if STOCK_IN_SHEET not in xls.sheet_names:
+        return None, None, None
+    raw = pd.read_excel(xls, STOCK_IN_SHEET, header=None)
+    for i in range(min(10, len(raw))):
+        row = [str(v).strip().replace(" ", "") if pd.notna(v) else "" for v in raw.iloc[i].tolist()]
+        if "분류" in row and "구분" in row:
+            def col(*names):
+                for n in names:
+                    for j, h in enumerate(row):
+                        if h.startswith(n):
+                            return j
+                return None
+            ck, cn, cg, cd, cq, cb = col("분류"), col("품목", "품명"), col("구분"), col("날짜"), col("수량"), col("비고")
+            if None in (ck, cn, cg, cq):
+                break
+            body = raw.iloc[i + 1:]
+            df = pd.DataFrame({
+                "분류": body.iloc[:, ck].astype("string").str.strip(),
+                "품목": body.iloc[:, cn].astype("string").str.strip(),
+                "구분": body.iloc[:, cg].astype("string").str.strip(),
+                "날짜": pd.to_datetime(body.iloc[:, cd], errors="coerce") if cd is not None else pd.NaT,
+                "수량": pd.to_numeric(body.iloc[:, cq], errors="coerce"),
+                "비고": body.iloc[:, cb].astype("string").fillna("") if cb is not None else "",
+            })
+            df = df[df["분류"].notna() & df["수량"].notna()]
+            df.loc[df["구분"].str.contains("현재", na=False), "구분"] = "현재고"
+            df.loc[df["구분"].str.contains("입고|예정", na=False), "구분"] = "입고예정"
+
+            rm = df[df["분류"].str.contains("원재료", na=False)].copy()
+            rm["원재료"] = np.where(rm["품목"].str.contains("볼", na=False), "볼",
+                                 np.where(rm["품목"].str.contains("파쇄", na=False), "파쇄", None))
+            rm = rm[rm["원재료"].notna()].rename(columns={"수량": "수량(톤)"})
+            tf = df[df["분류"].str.contains("두부", na=False) & ~df["분류"].str.contains("마이티펫", na=False)].copy()
+            tf = tf[tf["품목"].map(flavor_of).notna()].rename(columns={"수량": "수량(박스)"})
+            tf["맛"] = tf["품목"].map(flavor_of)
+            mp = df[df["분류"].str.contains("마이티펫", na=False)].copy()
+            return (rm[["원재료", "구분", "날짜", "수량(톤)", "비고"]].reset_index(drop=True),
+                    tf[["맛", "품목", "구분", "날짜", "수량(박스)", "비고"]].reset_index(drop=True),
+                    mp.reset_index(drop=True))
+    return None, None, None
+
+
+def parse_tofu_sheet(xls: pd.ExcelFile):
+    """두부모래재고 시트 → DataFrame(맛, 구분, 날짜, 수량(박스), 비고). 없으면 None"""
+    name = next((n for n in TOFU_SHEET_NAMES if n in xls.sheet_names), None)
+    if name is None:
+        return None
+    raw = pd.read_excel(xls, name, header=None)
+    for i in range(min(10, len(raw))):
+        row = [str(v).strip().replace(" ", "") if pd.notna(v) else "" for v in raw.iloc[i].tolist()]
+        if "구분" in row and any(h.startswith(("품목", "품명")) for h in row):
+            def col(*names):
+                for n in names:
+                    for j, h in enumerate(row):
+                        if h.startswith(n):
+                            return j
+                return None
+            cn, cg, cd, cq, cb = col("품목", "품명"), col("구분"), col("날짜", "입고"), col("수량"), col("비고")
+            if None in (cn, cg, cq):
+                return None
+            body = raw.iloc[i + 1:]
+            df = pd.DataFrame({
+                "맛": body.iloc[:, cn].map(flavor_of),
+                "품목": body.iloc[:, cn].astype("string").str.strip(),
+                "구분": body.iloc[:, cg].astype("string").str.strip(),
+                "날짜": pd.to_datetime(body.iloc[:, cd], errors="coerce") if cd is not None else pd.NaT,
+                "수량(박스)": pd.to_numeric(body.iloc[:, cq], errors="coerce"),
+                "비고": body.iloc[:, cb].astype("string") if cb is not None else "",
+            })
+            df.loc[df["구분"].str.contains("현재", na=False), "구분"] = "현재고"
+            df.loc[df["구분"].str.contains("입고|예정", na=False), "구분"] = "입고예정"
+            return df[df["맛"].notna() & df["수량(박스)"].notna()].reset_index(drop=True)
+    return None
+
+
+def parse_summary_tofu_stock(xls: pd.ExcelFile) -> dict:
+    """요약 시트 입고예정표의 두부모래 현재고 (두부모래재고 시트가 없을 때 임시로 씀)"""
+    res = {}
+    if SUMMARY_SHEET not in xls.sheet_names:
+        return res
+    raw = pd.read_excel(xls, SUMMARY_SHEET, header=None)
+    for i in range(len(raw)):
+        vals = raw.iloc[i].tolist()
+        for j, v in enumerate(vals):
+            sv = str(v)
+            if "두부" in sv and "마이티펫" not in sv and flavor_of(sv) and flavor_of(sv) not in res:
+                n = pd.to_numeric(vals[j + 1] if j + 1 < len(vals) else None, errors="coerce")
+                if pd.notna(n):
+                    res[flavor_of(sv)] = float(n)
+    return res
+
+
 def parse_summary_raw_stock(xls: pd.ExcelFile) -> dict:
     """요약 시트 입고예정표의 '벤토나이트_볼/파쇄' 현재고 (원재료 시트가 없을 때 임시로 씀)"""
     res = {}
@@ -329,10 +433,17 @@ def load_workbook(data: bytes):
     if GROUP_TARGET_SHEET in xls.sheet_names:
         grp_target = parse_group_target(pd.read_excel(xls, GROUP_TARGET_SHEET, header=None))
 
-    raw_mat = parse_raw_sheet(xls)
+    raw_mat, tofu, mightypet = parse_stock_in_sheet(xls)
+    if raw_mat is None:
+        raw_mat = parse_raw_sheet(xls)
     raw_fallback = parse_summary_raw_stock(xls) if raw_mat is None else {}
 
-    return buy, out, stock, stock_date, target, prior, names, grp_target, raw_mat, raw_fallback
+    if tofu is None:
+        tofu = parse_tofu_sheet(xls)
+    tofu_fallback = parse_summary_tofu_stock(xls) if tofu is None else {}
+
+    return (buy, out, stock, stock_date, target, prior, names, grp_target, raw_mat, raw_fallback,
+            tofu, tofu_fallback, mightypet)
 
 
 # ─────────────────────────────────────────────
@@ -440,7 +551,7 @@ if up is None:
 
 try:
     (buy, out, stock, stock_date, target, prior, sku_names, grp_target_xl,
-     raw_mat_xl, raw_fallback) = load_workbook(up.getvalue())
+     raw_mat_xl, raw_fallback, tofu_xl, tofu_fallback, mightypet_xl) = load_workbook(up.getvalue())
 except Exception as e:  # noqa: BLE001
     st.error(f"엑셀을 읽지 못했습니다: {e}")
     st.stop()
@@ -464,8 +575,9 @@ st.sidebar.caption(
     + (f"쿠팡 현재고 기준: {stock_date:%Y-%m-%d}" if stock_date is not None else "재고 현황 시트 없음")
 )
 
-tab_sales, tab_inv, tab_raw, tab_set = st.tabs(
-    ["💰 매출 · 쿠팡 PO", "📦 재고 · 결품", "🏭 원재료 발주", "⚙️ 데이터 설정 · 점검"])
+tab_sales, tab_inv, tab_order, tab_set = st.tabs(
+    ["💰 매출 · 쿠팡 PO", "📦 재고 · 결품", "🏭 발주 시뮬레이터", "⚙️ 데이터 설정 · 점검"])
+tab_raw, tab_tofu = tab_order.tabs(["원재료 (벤토나이트 볼·파쇄)", "두부모래"])
 
 # ─────────────────────────────────────────────
 # 3. 데이터 설정 (다른 탭이 이 값을 쓰므로 먼저 그림)
@@ -511,7 +623,8 @@ with tab_set:
     st.markdown("---")
     st.subheader("재고 계산 설정")
     sc1, sc2 = st.columns([1, 2])
-    window = sc1.selectbox("일평균 출고 기준 기간", [7, 14, 30, 90], index=2, format_func=lambda d: f"최근 {d}일")
+    window = sc1.selectbox("일평균 출고 기준 기간 (현재고 기준일까지)", [7, 14, 30, 90], index=0,
+                           format_func=lambda d: f"최근 {d}일")
     types_in_stock = sort_types(stock["유형"].unique()) if stock is not None else []
     lead = {}
     with sc2.expander("유형별 쿠팡 납품 리드타임(일)", expanded=False):
@@ -543,7 +656,7 @@ with tab_set:
         st.warning(
             f"엑셀에 '{RAW_SHEET}' 시트가 없어 요약 시트 입고예정표의 현재고만 임시로 넣었습니다. "
             "입고 예정분은 아래 표에 직접 추가하거나, 엑셀에 시트를 만들어 주세요 "
-            "(열: 원재료 | 구분(현재고/입고예정) | 날짜 | 수량(톤) | 비고)."
+            "(열: 분류 | 품목 | 구분 | 날짜 | 수량 | 단위 | 비고)."
         )
         raw_init = pd.DataFrame([
             {"원재료": m, "구분": "현재고", "날짜": base_ts, "수량(톤)": v, "비고": "요약 시트에서 읽음 · 확인 필요"}
@@ -558,17 +671,59 @@ with tab_set:
             "구분": st.column_config.SelectboxColumn(options=["현재고", "입고예정"], required=True),
             "날짜": st.column_config.DateColumn("날짜 (현재고 기준일 / 입고예정일)", format="YYYY-MM-DD"),
             "수량(톤)": st.column_config.NumberColumn(min_value=0, format="%.1f"),
-            "비고": st.column_config.TextColumn("비고 ('완료'라고 쓰면 계산에서 뺌)"),
+            "비고": st.column_config.TextColumn("비고"),
         },
     )
+
+
+with tab_set:
+    st.markdown("---")
+    st.subheader("두부모래 발주 설정")
+    t1, t2, t3, t4 = st.columns(4)
+    tofu_lead = t1.number_input("발주 → 물류 입고 (일)", min_value=0, max_value=180, value=40, step=1, key="tofu_lead")
+    tofu_safety = t2.number_input("안전재고 (며칠분)", min_value=0, max_value=90, value=14, step=1, key="tofu_safety")
+    tofu_unit = t3.number_input("발주 단위 (박스)", min_value=1, max_value=20000, value=1320, step=60, key="tofu_unit")
+    tofu_window = t4.selectbox("일평균 출고 기준 기간", [7, 14, 30, 60, 90], index=2, format_func=lambda d: f"최근 {d}일",
+                               key="tofu_window")
+    tofu_incl_vf = st.checkbox("쿠팡 VF 현재고도 우리 재고에 더해서 보기", value=True, key="tofu_vf",
+                               help="켜면 '평택 재고 + 쿠팡 VF 재고'가 소비자 출고로 줄어드는 것으로 계산합니다.")
+    if tofu_xl is not None:
+        st.caption("두부모래 평택 재고·입고예정은 엑셀 '재고입고관리' 시트에서 읽었습니다. 아래에서 고친 값은 새로고침하면 사라집니다.")
+        tofu_init = tofu_xl[["품목", "구분", "날짜", "수량(박스)", "비고"]].copy()
+    else:
+        st.warning("엑셀에 '재고입고관리' 시트가 없어 요약 시트의 현재고만 임시로 넣었습니다 (입고예정 없음). "
+                   "시트를 만들어 주세요 (열: 분류 | 품목 | 구분 | 날짜 | 수량 | 단위 | 비고).")
+        tofu_init = pd.DataFrame([
+            {"품목": f"7L 두부_{k}", "구분": "현재고", "날짜": base_ts, "수량(박스)": v, "비고": "요약 시트에서 읽음 · 확인 필요"}
+            for k, v in tofu_fallback.items()
+        ], columns=["품목", "구분", "날짜", "수량(박스)", "비고"])
+    tofu_init["날짜"] = pd.to_datetime(tofu_init["날짜"], errors="coerce").dt.date
+    tofu_init["비고"] = tofu_init["비고"].fillna("").astype(str)
+    tofu_rows = st.data_editor(
+        tofu_init, num_rows="dynamic", hide_index=True, use_container_width=True, key="tofu_editor",
+        column_config={
+            "구분": st.column_config.SelectboxColumn(options=["현재고", "입고예정"], required=True),
+            "날짜": st.column_config.DateColumn("날짜 (현재고 기준일 / 입고예정일)", format="YYYY-MM-DD"),
+            "수량(박스)": st.column_config.NumberColumn(min_value=0, format="%d"),
+            "비고": st.column_config.TextColumn("비고"),
+        },
+    )
+
+AVG_INFO = {}
 
 
 def compute_inv():
     if stock is None:
         return None, None
     last_out = out["날짜"].max()
-    win = out[out["날짜"] > last_out - pd.Timedelta(days=window)]
-    avg = win.groupby("sku id")["출고량"].sum() / window
+    # 일평균 출고: 현재고 기준일까지 최근 window일. 출고 데이터가 기준일보다 짧으면 있는 날짜만으로 나눔
+    anchor = stock_date if stock_date is not None else last_out
+    w_start = anchor - pd.Timedelta(days=window - 1)
+    w_end = min(anchor, last_out)
+    covered = max((w_end - w_start).days + 1, 1)
+    win = out[(out["날짜"] >= w_start) & (out["날짜"] <= w_end)]
+    avg = win.groupby("sku id")["출고량"].sum() / covered
+    AVG_INFO.update(start=w_start, end=w_end, days=covered, anchor=anchor)
 
     inv = stock.copy()
     inv["일평균출고"] = inv["sku id"].map(avg).fillna(0)
@@ -796,7 +951,10 @@ with tab_inv:
 
         st.subheader("쿠팡 VF 재고 · 결품 위험")
         st.caption(
-            f"현재고 기준 {stock_date:%m/%d} (벤플 수불)  ·  일평균 출고 = {last_out:%m/%d}까지 최근 {window}일  ·  "
+            f"현재고 기준 {stock_date:%m/%d} (벤플 수불)  ·  일평균 출고 = {AVG_INFO['start']:%m/%d}~{AVG_INFO['end']:%m/%d} "
+            f"{AVG_INFO['days']}일 평균"
+            + (f" (출고 데이터가 {last_out:%m/%d}까지라 {window}일 중 {AVG_INFO['days']}일만 반영)"
+               if AVG_INFO['days'] < window else "") + "  ·  "
             "소진예상일 = 현재고 기준일 + (현재고+입고예정) ÷ 일평균  ·  납품 데드라인 = 소진예상일 − 납품 리드타임"
         )
 
@@ -850,7 +1008,7 @@ with tab_inv:
             d1, d2, d3, d4 = st.columns(4)
             d1.metric("현재고", f"{r['현재고']:,.0f}")
             d2.metric("입고예정", f"{r['입고예정']:,.0f}")
-            d3.metric(f"일평균 출고 ({window}일)", f"{r['일평균출고']:,.1f}")
+            d3.metric(f"일평균 출고 ({AVG_INFO['start']:%m/%d}~{AVG_INFO['end']:%m/%d})", f"{r['일평균출고']:,.1f}")
             d4.metric("상태", r["상태"], f"데드라인 {r['데드라인']:%m/%d}" if pd.notna(r["데드라인"]) else None,
                       delta_color="off")
 
@@ -925,9 +1083,12 @@ def raw_plan(mat: str, rows: pd.DataFrame):
     inb = inb[~inb["비고"].astype(str).str.contains("완료", na=False)]
     undated = inb[inb["날짜"].isna()]
     inb = inb[inb["날짜"].notna()]
+    # 현재고 날짜 이전(같은 날 포함) 입고분은 이미 현재고에 들어 있다고 보고 뺌
+    included = inb[inb["날짜"].dt.normalize() <= start]
+    inb = inb[inb["날짜"].dt.normalize() > start]
     arrivals = {}
     for d, q in zip(inb["날짜"], inb["수량(톤)"]):
-        d = max(d.normalize(), start)
+        d = d.normalize()
         arrivals[d] = arrivals.get(d, 0) + float(q)
 
     prod = buy[(buy["구분"] == "제품") & (buy["유형"] == mat) & (buy["날짜"] <= base_ts)
@@ -973,12 +1134,14 @@ def raw_plan(mat: str, rows: pd.DataFrame):
             if arrive > days[-1]:
                 break
     return {"start": start, "stock0": stock0, "arrivals": arrivals, "undated": undated, "daily": daily,
+            "included": included,
             "safety": safety, "days": days, "base": base_traj, "plan_traj": sim(arr2), "runout": runout,
             "planned": planned, "gap_in_lead": gap_in_lead, "low_in_lead": low_in_lead, "earliest": earliest}
 
 
 with tab_raw:
     st.subheader("원재료(벤토나이트) 발주 필요 시기")
+    st.caption("입고가 끝나면 현재고 수량과 날짜만 바꾸면 됩니다. 현재고 날짜 이전 입고예정은 자동으로 빠집니다.")
     st.caption(
         f"하루 사용량 = 최근 {raw_window}일 볼·파쇄 제품 납품 톤 ÷ {raw_window} ÷ 수율 {raw_yield:g}  ·  "
         f"발주 → 공장 입고 {raw_lead}일  ·  안전재고 {raw_safety}일분  ·  "
@@ -988,7 +1151,7 @@ with tab_raw:
     if raw_mat_xl is None:
         st.error(
             f"⚠️ 올린 엑셀에 '{RAW_SHEET}' 시트가 없어, 숨겨진 요약 시트의 현재고만 임시로 쓰고 있습니다 "
-            "(입고 예정분 없음 → 결과가 틀립니다). 모래원재료 시트가 있는 최신 엑셀을 저장한 뒤 다시 올려 주세요."
+            "(입고 예정분 없음 → 결과가 틀립니다). '재고입고관리' 시트가 있는 최신 엑셀을 저장한 뒤 다시 올려 주세요."
         )
     else:
         st.success(f"'{RAW_SHEET}' 시트에서 원재료 현재고·입고예정을 읽었습니다.")
@@ -1033,6 +1196,9 @@ with tab_raw:
         if len(P["undated"]):
             st.warning(f"입고일이 비어 있는 입고예정 {len(P['undated'])}건({P['undated']['수량(톤)'].sum():,.0f}톤)은 "
                        "계산에서 뺐습니다. 날짜를 넣어 주세요.")
+        if len(P["included"]):
+            st.caption("✔️ 현재고 날짜 이전 입고분은 현재고에 이미 들어 있다고 보고 뺐습니다: "
+                       + ", ".join(f"{d:%m/%d} {q:,.0f}톤" for d, q in zip(P["included"]["날짜"], P["included"]["수량(톤)"])))
         if P["start"] < base_ts - pd.Timedelta(days=3):
             st.caption(f"⚠️ 현재고 기준일({P['start']:%m/%d})이 기준일보다 오래됐습니다. 최신 재고로 바꿔 주세요.")
 
@@ -1070,6 +1236,210 @@ with tab_raw:
                 st.caption(f"발주 단위별 버티는 기간: 220톤 ≈ {220 / P['daily']:,.0f}일, "
                            f"330톤 ≈ {330 / P['daily']:,.0f}일")
         st.markdown("---")
+
+
+# ─────────────────────────────────────────────
+# 두부모래 발주 시뮬레이터
+# ─────────────────────────────────────────────
+def plan_stock(stock0, start, arrivals, daily, lead, safety_days, unit, horizon=150):
+    """재고 예상 + 권장 발주 일정. 재고는 0 밑으로 안 내려감(모자란 날 = 공백)"""
+    days = pd.date_range(start, periods=horizon + 1)
+    safety = daily * safety_days
+
+    def sim(arr):
+        lv, res = stock0, []
+        for i, d in enumerate(days):
+            if i > 0:
+                lv = max(lv - daily, 0.0)
+            lv += arr.get(d, 0)
+            res.append(lv)
+        return np.array(res)
+
+    base_traj = sim(arrivals)
+    neg = np.where(base_traj <= 0)[0] if daily > 0 else []
+    runout = days[neg[0]] if len(neg) else None
+    earliest = base_ts + pd.Timedelta(days=int(lead))
+    in_lead = days < earliest
+    gap_in_lead = int(((base_traj <= 0) & in_lead).sum()) if daily > 0 else 0
+
+    arr2, planned, last_arrive = dict(arrivals), [], earliest - pd.Timedelta(days=1)
+    if daily > 0:
+        for _ in range(8):
+            traj = sim(arr2)
+            cand = [i for i in np.where(traj < safety)[0] if days[i] > last_arrive]
+            if not cand:
+                break
+            need = days[cand[0]]
+            order = max(need - pd.Timedelta(days=int(lead)), base_ts)
+            arrive = order + pd.Timedelta(days=int(lead))
+            arr2[arrive] = arr2.get(arrive, 0) + unit
+            planned.append({"발주일": order, "입고예정일": arrive, "수량": unit, "안전재고 미달일": need})
+            last_arrive = arrive
+            if arrive > days[-1]:
+                break
+    return {"days": days, "base": base_traj, "plan_traj": sim(arr2), "runout": runout, "planned": planned,
+            "safety": safety, "gap_in_lead": gap_in_lead, "earliest": earliest, "daily": daily}
+
+
+def plan_status(P):
+    nxt = P["planned"][0] if P["planned"] else None
+    if P["daily"] <= 0:
+        return "⚪ 출고 없음"
+    if P["gap_in_lead"]:
+        return f"🔴 {P['gap_in_lead']}일 결품 예상"
+    if nxt is None:
+        return "🟢 발주 불필요"
+    left = (nxt["발주일"] - base_ts).days
+    if left <= 0:
+        return "🟠 오늘 발주"
+    if left <= 7:
+        return f"🟠 {left}일 내 발주"
+    return f"🟢 {left}일 남음"
+
+
+with tab_tofu:
+    st.subheader("두부모래 발주 시뮬레이터")
+    st.caption("입고가 끝나면 현재고 수량과 날짜만 바꾸면 됩니다. 현재고 날짜 이전 입고예정은 자동으로 빠집니다.")
+    if tofu_xl is None:
+        st.error("⚠️ 엑셀에 '재고입고관리' 시트가 없어 요약 시트 현재고만 쓰고 있습니다 (입고예정 없음 → 결과가 틀립니다).")
+    tofu_skus = []
+    if stock is not None:
+        tofu_skus = [(int(r["sku id"]), r["품명"]) for _, r in stock[stock["유형"] == "두부"].iterrows()]
+    if not tofu_skus:
+        tofu_skus = [(int(k), v) for k, v in out[out["유형"] == "두부"].groupby("sku id")["품명"].last().items()]
+
+    end = min(stock_date if stock_date is not None else out["날짜"].max(), out["날짜"].max())
+    t_start = end - pd.Timedelta(days=tofu_window - 1)
+    st.caption(
+        f"재고 = 평택 재고{' + 쿠팡 VF 현재고' if tofu_incl_vf else ''} + 입고예정  ·  "
+        f"하루 출고 = 쿠팡 소비자 출고 {t_start:%m/%d}~{end:%m/%d} 평균  ·  발주 → 물류 입고 {tofu_lead}일  ·  "
+        f"안전재고 {tofu_safety}일분  ·  발주 단위 {tofu_unit:,}박스 (설정은 '데이터 설정' 탭)"
+    )
+
+    trows = tofu_rows.copy()
+    trows["맛"] = trows["품목"].map(flavor_of)
+    trows["날짜"] = pd.to_datetime(trows["날짜"], errors="coerce")
+    plans, summary = {}, []
+    for sku, name in tofu_skus:
+        fl = flavor_of(name)
+        rows = trows[(trows["맛"] == fl) & trows["수량(박스)"].notna()]
+        cur = rows[rows["구분"] == "현재고"].sort_values("날짜", na_position="first")
+        wh = float(cur["수량(박스)"].iloc[-1]) if len(cur) else 0.0
+        start = cur["날짜"].iloc[-1].normalize() if len(cur) and pd.notna(cur["날짜"].iloc[-1]) else base_ts
+        vf = 0.0
+        if tofu_incl_vf and stock is not None:
+            hit = stock.loc[stock["sku id"] == sku, "현재고"]
+            vf = float(hit.iloc[0]) if len(hit) else 0.0
+        inb = rows[(rows["구분"] == "입고예정") & ~rows["비고"].astype(str).str.contains("완료", na=False)]
+        undated = int(inb["날짜"].isna().sum())
+        dated = inb[inb["날짜"].notna()]
+        included = dated[dated["날짜"].dt.normalize() <= start]  # 현재고 날짜 이전 입고분은 이미 현재고에 포함
+        dated = dated[dated["날짜"].dt.normalize() > start]
+        arrivals = {}
+        for d, q in zip(dated["날짜"], dated["수량(박스)"]):
+            d = d.normalize()
+            arrivals[d] = arrivals.get(d, 0) + float(q)
+        so = out[(out["sku id"] == sku) & (out["날짜"] >= t_start) & (out["날짜"] <= end)]["출고량"].sum()
+        daily = float(so) / tofu_window
+        P = plan_stock(wh + vf, start, arrivals, daily, tofu_lead, tofu_safety, int(tofu_unit))
+        P.update(sku=sku, name=name, flavor=fl, wh=wh, vf=vf, arrivals=arrivals, start=start, undated=undated,
+                 included=included)
+        plans[sku] = P
+        nxt = P["planned"][0] if P["planned"] else None
+        total = wh + vf
+        summary.append({
+            "상태": plan_status(P), "품목": name, "평택 재고": wh, "쿠팡 VF": vf if tofu_incl_vf else np.nan,
+            "입고예정": sum(arrivals.values()), "하루 출고": daily,
+            "재고 일수": (total / daily) if daily > 0 else np.nan,
+            "입고 포함 일수": ((total + sum(arrivals.values())) / daily) if daily > 0 else np.nan,
+            "소진 예상일": P["runout"], "다음 발주일": nxt["발주일"] if nxt else pd.NaT,
+            "권장 수량": nxt["수량"] if nxt else np.nan, "sku": sku,
+        })
+
+    sdf = pd.DataFrame(summary).sort_values("다음 발주일", na_position="last").reset_index(drop=True)
+    n_red = int(sdf["상태"].str.startswith("🔴").sum())
+    n_or = int(sdf["상태"].str.startswith("🟠").sum())
+    k1, k2, k3 = st.columns(3)
+    k1.metric("🔴 결품 예상", f"{n_red}개 품목")
+    k2.metric("🟠 1주 내 발주", f"{n_or}개 품목")
+    k3.metric("합계 권장 발주 (다음 1회)", f"{sdf['권장 수량'].sum():,.0f}박스")
+
+    st.caption("👇 행을 클릭하면 아래에 품목별 재고 예상이 나옵니다.")
+    ev = st.dataframe(
+        sdf.drop(columns="sku"), hide_index=True, use_container_width=True, on_select="rerun",
+        selection_mode="single-row", key="tofu_table",
+        column_config={
+            "평택 재고": st.column_config.NumberColumn(format="localized"),
+            "쿠팡 VF": st.column_config.NumberColumn(format="localized"),
+            "입고예정": st.column_config.NumberColumn(format="localized"),
+            "하루 출고": st.column_config.NumberColumn(format="%.1f"),
+            "재고 일수": st.column_config.NumberColumn(format="%.0f"),
+            "입고 포함 일수": st.column_config.NumberColumn(format="%.0f"),
+            "소진 예상일": st.column_config.DateColumn(format="MM/DD"),
+            "다음 발주일": st.column_config.DateColumn(format="MM/DD"),
+            "권장 수량": st.column_config.NumberColumn(format="localized"),
+        })
+
+    sel = getattr(getattr(ev, "selection", None), "rows", []) or []
+    if len(sdf):
+        idx0 = sel[0] if sel and sel[0] < len(sdf) else 0
+        sku = st.selectbox("품목 상세", sdf["sku"].tolist(), index=idx0,
+                           format_func=lambda s: plans[s]["name"], key="tofu_pick")
+        P = plans[sku]
+        st.markdown(f"#### {P['name']}  ·  {plan_status(P)}")
+        if P["gap_in_lead"]:
+            st.error(f"앞으로 {tofu_lead}일({P['earliest']:%m/%d}) 안에 약 {P['gap_in_lead']}일 결품이 예상됩니다. "
+                     "지금 발주해도 그 전에는 못 받으니, 입고를 앞당기거나 쿠팡 PO 대응을 조정해야 합니다.")
+        if P["undated"]:
+            st.warning(f"입고일이 비어 있는 입고예정 {P['undated']}건은 계산에서 뺐습니다.")
+        if len(P["included"]):
+            st.caption("✔️ 현재고 날짜 이전 입고분은 현재고에 이미 들어 있다고 보고 뺐습니다: "
+                       + ", ".join(f"{d:%m/%d} {q:,.0f}박스" for d, q in zip(P["included"]["날짜"], P["included"]["수량(박스)"])))
+        nxt = P["planned"][0] if P["planned"] else None
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric(f"평택 재고 ({P['start']:%m/%d})", f"{P['wh']:,.0f}")
+        m2.metric("쿠팡 VF 현재고", f"{P['vf']:,.0f}" if tofu_incl_vf else "제외")
+        m3.metric("입고 예정", f"{sum(P['arrivals'].values()):,.0f}", f"{len(P['arrivals'])}건", delta_color="off")
+        m4.metric("하루 출고", f"{P['daily']:,.1f}", f"월 {P['daily'] * 30:,.0f}", delta_color="off")
+        m5.metric("다음 발주일", f"{nxt['발주일']:%m/%d}" if nxt else "-",
+                  f"{nxt['수량']:,}박스 → {nxt['입고예정일']:%m/%d} 입고" if nxt else None, delta_color="off")
+        g1, g2 = st.columns([3, 2])
+        with g1:
+            fig = go.Figure()
+            fig.add_scatter(x=P["days"], y=P["base"], name="확정 입고만", mode="lines", line=dict(width=2))
+            if P["planned"]:
+                fig.add_scatter(x=P["days"], y=P["plan_traj"], name="권장 발주 포함", mode="lines",
+                                line=dict(width=2, dash="dash"))
+            if P["arrivals"]:
+                fig.add_bar(x=list(P["arrivals"].keys()), y=list(P["arrivals"].values()), name="입고 예정", opacity=0.55)
+            if P["planned"]:
+                fig.add_bar(x=[p["입고예정일"] for p in P["planned"]], y=[p["수량"] for p in P["planned"]],
+                            name="권장 발주 입고", opacity=0.35)
+            fig.add_hline(y=P["safety"], line_dash="dot", annotation_text=f"안전재고 {P['safety']:,.0f}")
+            fig.add_hline(y=0, line_color="red", line_width=1)
+            fig.update_layout(title="재고 예상 (150일, 박스)", height=360,
+                              legend=dict(orientation="h", y=-0.18), margin=dict(t=50, b=10))
+            st.plotly_chart(fig, use_container_width=True)
+        with g2:
+            st.markdown("**권장 발주 일정**")
+            if P["planned"]:
+                st.dataframe(pd.DataFrame(P["planned"]), hide_index=True, use_container_width=True,
+                             column_config={"발주일": st.column_config.DateColumn(format="MM/DD"),
+                                            "입고예정일": st.column_config.DateColumn(format="MM/DD"),
+                                            "안전재고 미달일": st.column_config.DateColumn(format="MM/DD"),
+                                            "수량": st.column_config.NumberColumn("수량(박스)", format="localized")})
+            else:
+                st.caption("150일 안에 추가 발주가 필요하지 않습니다.")
+            if P["daily"] > 0:
+                st.caption(f"발주 1회({tofu_unit:,}박스)로 버티는 기간 ≈ {tofu_unit / P['daily']:,.0f}일")
+
+    if mightypet_xl is not None and len(mightypet_xl):
+        with st.expander(f"마이티펫 두부모래 (네이버 · 글로브 직송) 재고·입고 {len(mightypet_xl)}건"):
+            st.caption("마이티펫은 발주 계산은 하지 않고, 재고입고관리 시트 내용만 보여 줍니다.")
+            st.dataframe(mightypet_xl[["품목", "구분", "날짜", "수량", "비고"]], hide_index=True,
+                         use_container_width=True,
+                         column_config={"날짜": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                                        "수량": st.column_config.NumberColumn(format="localized")})
 
 
 # ─────────────────────────────────────────────
