@@ -567,6 +567,32 @@ base_ts = pd.Timestamp(base_date)
 cur_p = pd.Period(base_ts, "M")
 month_end = cur_p.end_time.normalize()
 
+# ── 마이티펫(글로브 직송): 재고입고관리 시트의 입고예정 = 그대로 네이버 매출 예정
+MP_GROUP = "마이티펫(네이버)"
+buy["직송예정"] = False
+mp_hist = buy[buy["유형"] == "마이티펫"].sort_values("날짜")
+mp_price = (float(mp_hist["금액(원)"].iloc[-1] / mp_hist["수량(BOX)"].iloc[-1])
+            if len(mp_hist) and mp_hist["수량(BOX)"].iloc[-1] else np.nan)
+mp_plan = pd.DataFrame()
+if mightypet_xl is not None and len(mightypet_xl) and pd.notna(mp_price):
+    mp_plan = mightypet_xl[(mightypet_xl["구분"] == "입고예정") & mightypet_xl["날짜"].notna()].copy()
+    mp_plan = mp_plan[~mp_plan["비고"].astype(str).str.contains("완료", na=False)]
+    # 이미 RAW_매입에 들어온 직송(±7일)은 빼고, 기준일보다 1주 넘게 지난 예정도 뺌
+    keep = []
+    for d in mp_plan["날짜"]:
+        dup = ((mp_hist["날짜"] - d).abs() <= pd.Timedelta(days=7)).any()
+        keep.append((not dup) and d > base_ts - pd.Timedelta(days=7))
+    mp_plan = mp_plan[keep]
+    if len(mp_plan):
+        extra = pd.DataFrame({
+            "날짜": mp_plan["날짜"].dt.normalize(), "품목": "마이티펫 직송 예정", "공급채널": "네이버", "구분": "상품",
+            "유형": "마이티펫", "수량(BOX)": mp_plan["수량"].values, "금액(원)": mp_plan["수량"].values * mp_price,
+            "입고처": "글로브 직송", "발주일": pd.NaT, "sku id": None, "상품군": MP_GROUP, "브랜드": "기타",
+            "직송예정": True,
+        })
+        extra["ym"] = extra["날짜"].dt.to_period("M")
+        buy = pd.concat([buy, extra], ignore_index=True)
+
 st.sidebar.caption(f"📄 {up.name}")
 st.sidebar.markdown("---")
 st.sidebar.caption(
@@ -771,6 +797,8 @@ def month_stats(df: pd.DataFrame):
     last_conf = max(base_ts, cur["날짜"].max()) if len(cur) else base_ts
     remaining = max(0, (month_end - last_conf.normalize()).days)
     fc = recent * remaining if month_end >= base_ts else 0
+    if len(df) and (df["상품군"] == MP_GROUP).all():
+        fc = 0.0  # 직송은 한 달에 한 번 몰아서 들어오므로 일평균 예측을 쓰지 않음 (재고입고관리 예정분만 반영)
     return float(act), float(conf), float(fc)
 
 
@@ -1433,13 +1461,37 @@ with tab_tofu:
             if P["daily"] > 0:
                 st.caption(f"발주 1회({tofu_unit:,}박스)로 버티는 기간 ≈ {tofu_unit / P['daily']:,.0f}일")
 
-    if mightypet_xl is not None and len(mightypet_xl):
-        with st.expander(f"마이티펫 두부모래 (네이버 · 글로브 직송) 재고·입고 {len(mightypet_xl)}건"):
-            st.caption("마이티펫은 발주 계산은 하지 않고, 재고입고관리 시트 내용만 보여 줍니다.")
-            st.dataframe(mightypet_xl[["품목", "구분", "날짜", "수량", "비고"]], hide_index=True,
-                         use_container_width=True,
-                         column_config={"날짜": st.column_config.DateColumn(format="YYYY-MM-DD"),
-                                        "수량": st.column_config.NumberColumn(format="localized")})
+    st.markdown("---")
+    st.markdown("#### 마이티펫 두부모래 (네이버 · 글로브 직송)")
+    st.caption("공장에서 네이버로 바로 가서 재고가 없으므로, 직송 이력과 다음 예정만 봅니다. "
+               "재고입고관리 시트의 마이티펫 입고예정은 매출 탭에 '확정' 매출로 반영됩니다.")
+    hist_dates = mp_hist.groupby("날짜")["수량(BOX)"].sum()
+    cycle = hist_dates.index.to_series().diff().dt.days.dropna()
+    nxt_mp = mp_plan.sort_values("날짜").iloc[0] if len(mp_plan) else None
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("지난 직송", f"{hist_dates.index[-1]:%m/%d}" if len(hist_dates) else "-",
+              f"{hist_dates.iloc[-1]:,.0f}박스" if len(hist_dates) else None, delta_color="off")
+    c2.metric("평균 주기", f"{cycle.mean():.0f}일" if len(cycle) else "-",
+              f"최근 {len(hist_dates)}회 기준" if len(cycle) else None, delta_color="off")
+    if nxt_mp is not None:
+        c3.metric("다음 직송 예정", f"{nxt_mp['날짜']:%m/%d}", f"{nxt_mp['수량']:,.0f}박스", delta_color="off")
+        c4.metric("예상 매출", fmt_krw(nxt_mp["수량"] * mp_price), f"박스당 {mp_price:,.0f}원 (지난 단가)",
+                  delta_color="off")
+    else:
+        guess = hist_dates.index[-1] + pd.Timedelta(days=round(cycle.mean())) if len(cycle) else None
+        c3.metric("다음 직송 예정", "시트에 없음", f"주기로 보면 {guess:%m/%d} 무렵" if guess is not None else None,
+                  delta_color="off")
+        c4.metric("예상 매출", "-")
+    rows_mp = [{"날짜": d, "수량(박스)": q, "구분": "직송 완료", "금액(원)": mp_hist[mp_hist["날짜"] == d]["금액(원)"].sum()}
+               for d, q in hist_dates.items()]
+    rows_mp += [{"날짜": r["날짜"], "수량(박스)": r["수량"], "구분": "직송 예정", "금액(원)": r["수량"] * mp_price}
+                for _, r in mp_plan.iterrows()]
+    if rows_mp:
+        st.dataframe(pd.DataFrame(rows_mp).sort_values("날짜", ascending=False), hide_index=True,
+                     use_container_width=True,
+                     column_config={"날짜": st.column_config.DateColumn(format="YYYY-MM-DD"),
+                                    "수량(박스)": st.column_config.NumberColumn(format="localized"),
+                                    "금액(원)": st.column_config.NumberColumn(format="localized")})
 
 
 # ─────────────────────────────────────────────
